@@ -1,0 +1,468 @@
+"""
+MT3 Deployment Script
+
+Demonstrates the complete MT3 pipeline:
+1. Load test image and pre-computed segmentation from assets/inference_example/
+2. Retrieve similar demonstration via hierarchical retrieval
+3. Estimate relative pose with PointNet++ (shows registration result)
+4. Refine pose with Generalized ICP (shows registration result again)
+5. Apply 4DOF inductive bias (constrain to tabletop manipulation)
+6. Transform demonstration bottleneck pose to live scene
+7. Access demonstration velocities for replay
+
+Note: Registration results will be visualized twice:
+- Once after PointNet++ initial estimate
+- Once after ICP refinement (close first window to continue)
+
+For actual robot deployment:
+- Replace test image loading with live camera capture
+- Provide pre-computed segmentation masks for target objects
+- Provide demonstrations on your own robot platform
+- For alignment, reach bottleneck pose with motion planning
+- For interaction, replay velocities in end-effector frame
+"""
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image
+from pathlib import Path
+
+from thousand_tasks.core.globals import ASSETS_DIR
+from thousand_tasks.core.utils.scene_state import SceneState
+from thousand_tasks.core.utils.se3_tools import pose_inv, rot2euler, euler2rot
+from thousand_tasks.retrieval.hierarchical_retrieval import HierarchicalRetrieval
+from thousand_tasks.perception.pose_estimation.pnet_4dof_pose_regressor import PointnetPoseRegressor_4dof
+from thousand_tasks.perception.pose_estimation.icp_6dof_pose_estimation_refinement import Open3dIcpPoseRefinement
+
+
+def visualize_test_scene(rgb, depth, segmap, save_path):
+    """Visualize test scene with RGB, depth, and segmentation."""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+
+    axes[0].imshow(rgb)
+    axes[0].set_title('RGB Image')
+    axes[0].axis('off')
+
+    axes[1].imshow(depth, cmap='viridis')
+    axes[1].set_title('Depth Map')
+    axes[1].axis('off')
+
+    segmented_rgb = rgb * segmap[..., None]
+    axes[2].imshow(segmented_rgb)
+    axes[2].set_title('Segmented RGB')
+    axes[2].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=150, bbox_inches='tight')
+    print(f"  Saved visualization to: {save_path}")
+    plt.close()
+
+
+def visualize_retrieval(test_rgb, test_segmap, demo_rgb, demo_segmap, save_path):
+    """Visualize test and retrieved demo with segmentation masks in 2x2 layout."""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 12))
+
+    # First row: Live scene
+    axes[0, 0].imshow(test_rgb)
+    axes[0, 0].set_title('Live Scene - RGB')
+    axes[0, 0].axis('off')
+
+    axes[0, 1].imshow(test_rgb * test_segmap[..., None])
+    axes[0, 1].set_title('Live Scene - Segmented')
+    axes[0, 1].axis('off')
+
+    # Second row: Retrieved demo
+    axes[1, 0].imshow(demo_rgb)
+    axes[1, 0].set_title('Retrieved Demo - RGB')
+    axes[1, 0].axis('off')
+
+    axes[1, 1].imshow(demo_rgb * demo_segmap[..., None])
+    axes[1, 1].set_title('Retrieved Demo - Segmented')
+    axes[1, 1].axis('off')
+
+    plt.tight_layout()
+    plt.savefig(str(save_path), dpi=150, bbox_inches='tight')
+    print(f"  Saved retrieval visualization to: {save_path}")
+    plt.close()
+
+
+def visualize_point_clouds(live_pcd, demo_pcd):
+    """Visualize live and retrieved demonstration point clouds side by side."""
+    import open3d as o3d
+
+    # Create coordinate frame
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
+
+    print("  Displaying point clouds (close window to continue)...")
+    o3d.visualization.draw_geometries(
+        [live_pcd, demo_pcd, coord_frame],
+        window_name="Object from Live Scene and Retrieved Demo",
+        width=800,
+        height=600,
+        point_show_normal=False
+    )
+
+
+def apply_4dof_inductive_bias(W_T_delta_6dof: np.ndarray, T_WE: np.ndarray) -> np.ndarray:
+    """
+    Apply 4DOF inductive bias to transformation (constrain to 4DOF: x, y, z, yaw).
+
+    This function constrains a 6DOF transformation to only 4DOF by:
+    1. Removing roll and pitch rotations (keeping only yaw around vertical axis)
+    2. Adjusting translation to compensate for the rotation constraint
+
+    The inductive bias is useful for tabletop manipulation tasks where objects
+    typically only rotate around the vertical (z) axis, not around x or y axes.
+    This reduces the search space and improves robustness.
+
+    Args:
+        W_T_delta_6dof: 4x4 transformation matrix (demo → live) in world frame
+        T_WE: 4x4 end-effector pose in world frame (used for rotation center)
+
+    Returns:
+        W_T_delta_4dof: 4x4 transformation constrained to 4DOF (x, y, z, yaw)
+
+    Mathematical explanation:
+    -------------------------
+    For tabletop tasks, we want to preserve:
+    - Full translation (x, y, z)
+    - Yaw rotation (θz around vertical axis)
+
+    But remove:
+    - Roll rotation (θx around x-axis)
+    - Pitch rotation (θy around y-axis)
+
+    The key insight is that when we remove roll/pitch, we must adjust the
+    translation to keep the end-effector at the correct position. This is
+    done by:
+    1. Computing translation if we rotate around end-effector: R_6dof @ t_E
+    2. Computing translation if we rotate around origin with 4DOF: R_4dof @ t_E
+    3. Adding the difference to compensate: t_4dof = t_6dof + (R_6dof - R_4dof) @ t_E
+
+    Note: We use a point 24cm above the end-effector (gripper tip) as the
+    rotation center to better match the contact point with objects.
+    """
+    # Create a copy of end-effector pose and move 24cm up (to gripper tip)
+    # This accounts for the offset between wrist and actual contact point
+    T_WE_copy = T_WE.copy()
+    T_WE_copy[:3, 3] += T_WE_copy[:3, :3] @ np.array([0, 0, 0.24])
+    t_WE = T_WE_copy[:3, 3:]  # Position of rotation center
+
+    # Extract rotation and translation from 6DOF transformation
+    W_R_delta_6dof = W_T_delta_6dof[:3, :3]
+    W_t_delta_6dof = W_T_delta_6dof[:3, 3:]
+
+    # Convert 6DOF rotation to Euler angles (xyz convention)
+    three_dof_euler = rot2euler('xyz', W_R_delta_6dof, degrees=False)
+
+    # Zero out roll (θx) and pitch (θy), keeping only yaw (θz)
+    # This constrains rotation to vertical axis only
+    three_dof_euler[:2] = 0
+
+    # Convert back to rotation matrix (now only yaw rotation)
+    W_R_delta_4dof = euler2rot('xyz', three_dof_euler, degrees=False)
+
+    # Adjust translation to compensate for rotation constraint
+    # Formula: t_new = t_old + (R_old - R_new) @ rotation_center
+    # This ensures the end-effector still reaches the same world position
+    # even though we've constrained the rotation
+    W_t_delta_4dof = W_R_delta_6dof @ t_WE + W_t_delta_6dof - W_R_delta_4dof @ t_WE
+
+    # Construct 4DOF transformation matrix
+    W_T_delta_4dof = np.eye(4)
+    W_T_delta_4dof[:3, :3] = W_R_delta_4dof
+    W_T_delta_4dof[:3, 3:] = W_t_delta_4dof
+
+    return W_T_delta_4dof
+
+
+def main():
+    # -------------------------------------------------------------------------
+    # Setup
+    # -------------------------------------------------------------------------
+    inference_dir = ASSETS_DIR / 'inference_example'
+    demo_dir = ASSETS_DIR / 'demonstrations'
+
+    # Task-specific parameters
+    task_name = 'pick_up_cube'
+
+    print("="*80)
+    print("MT3 Deployment")
+    print("="*80)
+
+    # -------------------------------------------------------------------------
+    # Step 1: Load test image
+    # -------------------------------------------------------------------------
+    # In practice, capture RGB-D image from camera
+    print("\nStep 1: Load test image")
+
+    # Load RGB and depth from workspace images
+    test_rgb = np.array(Image.open(str(inference_dir / 'head_camera_ws_rgb.png')))
+    test_depth = np.array(Image.open(str(inference_dir / 'head_camera_ws_depth_to_rgb.png')))
+
+    # Load segmentation mask for the target object (pre-computed)
+    test_segmap = np.load(str(inference_dir / 'head_camera_ws_segmap.npy'))
+
+    # Load camera intrinsics
+    intrinsics = np.load(str(inference_dir / 'head_camera_rgb_intrinsic_matrix.npy'))
+
+    # Load camera extrinsics (world-to-camera transform)
+    T_WC = np.load(str(ASSETS_DIR / 'T_WC_head.npy'))
+
+    print(f"  Loaded RGB: {test_rgb.shape}, Depth: {test_depth.shape}, Segmap: {test_segmap.shape}")
+
+    # Visualize test image, depth, and segmentation
+    vis_dir = ASSETS_DIR / 'example_visualisations'
+    vis_dir.mkdir(exist_ok=True)
+
+    save_path = vis_dir / 'test_scene_visualization.png'
+    visualize_test_scene(test_rgb, test_depth, test_segmap, save_path)
+
+    # -------------------------------------------------------------------------
+    # Step 2: Initialize live scene state
+    # -------------------------------------------------------------------------
+    print("\nStep 2: Initialize live scene state")
+    live_scene_state = SceneState.initialise_from_dict({
+        'rgb': test_rgb,
+        'depth': test_depth,
+        'segmap': test_segmap,
+        'intrinsic_matrix': intrinsics
+    })
+
+    # Process segmentation: erode mask and crop to object region
+    live_scene_state.erode_segmap()
+    live_scene_state.crop_object_using_segmap()
+    print(f"  Processed segmentation for: '{task_name}'")
+
+    # Visualize point cloud with Open3D
+    import open3d as o3d
+    pcd = live_scene_state.o3d_pcd
+    print(f"  Point cloud has {len(pcd.points)} points")
+
+    # Create coordinate frame for reference
+    coord_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1, origin=[0, 0, 0])
+
+    print("  Displaying point cloud (close window to continue)...")
+    o3d.visualization.draw_geometries(
+        [pcd, coord_frame],
+        window_name="Live Scene Point Cloud",
+        width=800,
+        height=600,
+        point_show_normal=False
+    )
+
+    # -------------------------------------------------------------------------
+    # Step 3: Retrieve similar demonstration
+    # -------------------------------------------------------------------------
+    print("\nStep 3: Retrieve demonstration via hierarchical retrieval")
+    retrieval = HierarchicalRetrieval(
+        T_WC_demo=T_WC,
+        T_WC_live=T_WC,
+        learned_tasks_dir=str(demo_dir)
+    )
+
+    # Retrieve most similar demo based on visual similarity
+    retrieved_demo_name = retrieval.get_most_similar_demo_name(
+        scene_state=live_scene_state,
+        template_task_description=task_name
+    )
+
+    print(f"  Retrieved: {retrieved_demo_name}")
+
+    # -------------------------------------------------------------------------
+    # Step 4: Load and segment demonstration
+    # -------------------------------------------------------------------------
+    print("\nStep 4: Load retrieved demonstration")
+    demo_path = demo_dir / retrieved_demo_name
+
+    # Load workspace images
+    demo_rgb = np.array(Image.open(str(demo_path / 'head_camera_ws_rgb.png')))
+    demo_depth = np.array(Image.open(str(demo_path / 'head_camera_ws_depth_to_rgb.png')))
+    demo_segmap = np.load(str(demo_path / 'head_camera_ws_segmap.npy'))
+    demo_intrinsics = np.load(str(demo_path / 'head_camera_rgb_intrinsic_matrix.npy'))
+
+    demo_scene_state = SceneState.initialise_from_dict({
+        'rgb': demo_rgb,
+        'depth': demo_depth,
+        'segmap': demo_segmap,
+        'intrinsic_matrix': demo_intrinsics
+    })
+
+    # Process demonstration segmentation
+    demo_scene_state.erode_segmap()
+    demo_scene_state.crop_object_using_segmap()
+
+    # Visualize retrieval results
+    retrieval_vis_path = vis_dir / 'retrieval_visualization.png'
+    visualize_retrieval(test_rgb, live_scene_state.segmap, demo_rgb, demo_scene_state.segmap, retrieval_vis_path)
+
+    # Visualize point clouds comparison
+    visualize_point_clouds(live_scene_state.o3d_pcd, demo_scene_state.o3d_pcd)
+
+    # =========================================================================
+    # PART 1: ALIGNMENT - Estimate target pose for robot
+    # =========================================================================
+
+    # -------------------------------------------------------------------------
+    # Step 5: Estimate relative pose with PointNet++
+    # -------------------------------------------------------------------------
+    print("\nStep 5: Estimate relative pose with PointNet++")
+    pose_estimator = PointnetPoseRegressor_4dof(
+        filter_pointcloud=True,
+        n_points=2048,
+        T_WC=T_WC,
+        T_WC_demo=T_WC,
+        depth_units='mm',
+        device=torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    )
+
+    # Estimate transformation from demo to live scene (in world frame)
+    W_T_delta = pose_estimator.estimate_relative_pose(
+        scene1_state=demo_scene_state,
+        scene2_state=live_scene_state,
+        visualise_pcds=True,
+        verbose=False
+    )
+
+    print(f"  PointNet++ prediction complete")
+
+    # -------------------------------------------------------------------------
+    # Step 5b: Refine pose estimate with Generalized ICP
+    # -------------------------------------------------------------------------
+    print("\nStep 5b: Refine pose with Generalized ICP")
+    print("  Initializing ICP refinement...")
+
+    # Initialize ICP pose refiner with Generalized ICP
+    # Generalized ICP uses point-to-plane distances with covariance weighting
+    # for more robust alignment than standard point-to-point ICP
+    pose_refiner = Open3dIcpPoseRefinement(
+        error_metric='generalised-icp',     # Use Generalized ICP (GICP)
+        max_correspondence_distance=0.1,    # Max distance for point correspondence (10cm)
+        max_iteration=20,                   # Max ICP iterations per trial
+        depth_units='mm',                   # Match depth units from pose estimator
+        timeout=3                           # Run multiple trials for 3 seconds
+    )
+
+    # Convert world-frame transformation to camera frame for ICP
+    # ICP works in camera frame where point clouds are expressed
+    C_T_delta = pose_inv(T_WC) @ W_T_delta @ T_WC
+
+    # Refine pose using Generalized ICP
+    # This runs multiple ICP trials with small perturbations around the
+    # PointNet++ prediction to find the best alignment
+    C_T_delta_refined = pose_refiner.refine_relative_pose(
+        scene1_state=demo_scene_state,
+        scene2_state=live_scene_state,
+        T_delta_init=C_T_delta,
+        T_WC_live=T_WC,
+        verbose=False,
+        visualise_pcds=True
+    )
+
+    # Convert refined pose back to world frame
+    W_T_delta_refined = T_WC @ C_T_delta_refined @ pose_inv(T_WC)
+
+    print(f"  ICP refinement complete")
+
+    # -------------------------------------------------------------------------
+    # Step 6: Apply 4DOF inductive bias
+    # -------------------------------------------------------------------------
+    print("\nStep 6: Apply 4DOF inductive bias")
+
+    # Load demonstration bottleneck pose to get rotation center
+    demo_bottleneck_pose = np.load(str(demo_path / 'bottleneck_pose.npy'))
+
+    # Apply 4DOF constraint (x, y, z, yaw only - no roll/pitch)
+    # This constrains the transformation to only allow yaw rotation around
+    # the vertical axis, which is appropriate for tabletop manipulation
+    W_T_delta_4dof = apply_4dof_inductive_bias(
+        W_T_delta_6dof=W_T_delta_refined,
+        T_WE=demo_bottleneck_pose
+    )
+
+    print(f"  4DOF constraint applied (removed roll and pitch)")
+
+    # -------------------------------------------------------------------------
+    # Step 7: Transform demonstration bottleneck pose to live scene
+    # -------------------------------------------------------------------------
+    print("\nStep 7: Transform bottleneck pose to live scene")
+
+    # Transform demonstration bottleneck pose to live scene using the
+    # refined and constrained relative transformation
+    # Formula: T_WE_live = W_T_delta_4dof @ T_WE_demo
+    # This applies the estimated transformation to get the target pose in the live scene
+    live_bottleneck_pose = W_T_delta_4dof @ demo_bottleneck_pose
+
+    print(f"  Demo bottleneck pose (T_WE):\n{demo_bottleneck_pose}")
+    print(f"  Live bottleneck pose (T_WE):\n{live_bottleneck_pose}")
+    print("\n" + "="*80)
+    print("ALIGNMENT PHASE COMPLETE")
+    print("="*80)
+    print("Target end-effector pose for live scene:")
+    print(f"{live_bottleneck_pose}")
+    print("\nUse motion planning (e.g., MoveIt, OMPL) or a linear controller")
+    print("to move the robot's end-effector to this bottleneck pose.")
+    print("="*80)
+
+    # =========================================================================
+    # PART 2: INTERACTION - Replay demonstration velocities
+    # =========================================================================
+    # -------------------------------------------------------------------------
+    # Step 8: Load demonstrated end-effector twists
+    # -------------------------------------------------------------------------
+    print("\n\nPART 2: INTERACTION")
+    print("="*80)
+    print("Step 8: Load demonstration end-effector twists")
+
+    # Load end-effector velocities/twists
+    end_effector_twists = np.load(str(demo_path / 'demo_eef_twists.npy'))
+
+    # update here
+
+    # After loading end_effector_twists (around line 419)  
+    end_effector_twists = np.load(str(demo_path / 'demo_eef_twists.npy'))  
+    
+    # Save data to ROS workspace  
+    #save_dir = Path('/home/aitana_viudes/interbotix_ws/src/interbotix_ros_manipulators/interbotix_ros_xsarms/examples/python_demos/saved_data')  
+    #save_dir.mkdir(parents=True, exist_ok=True)  
+    
+    # Save the computed bottleneck pose and twists  
+    #np.save(save_dir / 'live_bottleneck_pose.npy', live_bottleneck_pose)  
+    #np.save(save_dir / 'end_effector_twists.npy', end_effector_twists)  
+    
+    #print(f"\n  Saved data to: {save_dir}")  
+    #print(f"    - live_bottleneck_pose.npy: {live_bottleneck_pose.shape}")  
+    #print(f"    - end_effector_twists.npy: {end_effector_twists.shape}")
+
+    # In deploy_mt3.py, replace the save path with:  
+    save_dir = Path('/workspace/saved_data')  # This is mounted to your host  
+    save_dir.mkdir(parents=True, exist_ok=True)  
+    
+    np.save(save_dir / 'live_bottleneck_pose.npy', live_bottleneck_pose)  
+    np.save(save_dir / 'end_effector_twists.npy', end_effector_twists)
+
+    # Verify dimensionality and explain format
+    num_timesteps, twist_dim = end_effector_twists.shape
+    print(f"  Loaded twists: {end_effector_twists.shape}")
+    print(f"    - Timesteps: {num_timesteps}")
+    print(f"    - Dimensions per timestep: {twist_dim}")
+
+    print("    - Format: 6D twist + gripper state at next timestep")
+    print("      [vx, vy, vz, wx, wy, wz, gripper_next]")
+    print("      where gripper_next: 1 = close, 0 = open")
+
+    print("\n" + "="*80)
+    print("INTERACTION PHASE")
+    print("="*80)
+    print("Once the robot reaches the bottleneck pose, replay these velocities:")
+    print(f"  1. Use a velocity controller to track the demonstrated end-effector twists")
+    print(f"  2. Execute twists in the end-effector frame at the recorded frequency")
+    print(f"  3. Replay all {num_timesteps} timesteps sequentially")
+    print(f"  4. Update gripper state according to the 7th dimension at each timestep")
+    print("="*80)
+
+
+
+if __name__ == '__main__':
+    main()
