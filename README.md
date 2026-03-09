@@ -112,10 +112,29 @@ The following data will save within the collected_demos/session_[TIMESTAMP]/demo
 
 Stop the `roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s` process before moving on to pass our collected demonstration to the mt3 pipeline. We are going to check the the demonstration has been correctly recorded by replaying it in the rviz simulator (real life robot will not replay it): <br><br>
 `roslaunch interbotix_xsarm_descriptions xsarm_description.launch robot_model:=wx200 use_joint_pub_gui:=true`
-  
-replay to check (no mt3 pipeline)
 
-python3 replay_demo_v2_last_2.py --demo_dir collected_demos/session_20260306_152850/demo_0000
+## Demonstration Replay
+
+To replay a previously recorded demonstration, run the `replay_live.py` script in the `python_demos` directory. The system will automatically detect if the physical robot is active or if it should run in RViz simulation mode.
+
+# Example: Replaying a specific demonstration
+`python3 replay_live.py --demo_dir collected_demos/session_20260306_152850/demo_0000`
+
+### How Replay Works
+
+The `replay_live.py` script utilizes a **Modern Robotics** based IK solver to translate end-effector targets into joint angles.
+
+1. **Initialization:** The script checks for the `xs_sdk` node. If missing, it enters **Simulation Mode**.
+2. **Trajectory Synthesis:** It loads the `.npy` files and uses `se3_exp` to integrate twists if necessary.
+3. **IK Verification:** It runs an IK pass for every waypoint, ensuring the path is physically reachable.
+4. **Execution:** - In **Real Mode**, it sends trajectory segments to the Dynamixel controllers.
+   - In **Sim Mode**, it publishes JointStates to update the RViz model.
+
+If everything looks as expected, then we shouold run the bash script `update_demo.sh` inside `collected_demos`. <br>
+`./update_demo.sh -s session....` <br>
+What this file does is basically update the demonstration `pick_up_shoe` in `1000_tasks/learning_thousand_tasks/assets/demonstrations/pick_up_shoe` and also update the files inside `1000_tasks/learning_thousand_tasks/assets/inference_example`.
+
+Now we can execute 
 
 make deploy_mt3 
 
