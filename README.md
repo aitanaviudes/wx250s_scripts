@@ -1,6 +1,6 @@
-# pipeline worflow
+# Pipeline Worflow
 
-## Camera and Interbotix arm setup
+## Camera and Interbotix Arm Setup
 
 run in a terminal:
 
@@ -14,29 +14,69 @@ you can check the topics of both the arm and intelisense camera doing:
 
 `rostopic list` 
 
-in another terminal, for simplicity, launch another rviz window:
+<br>
+In another terminal, for simplicity, launch another rviz window:
 
 `rviz` 
 
-- Add a ‘`RobotModel`’
+- In the "Global Options" panel on the left, change the Fixed Frame from `map` to `wx250s/base_link`
 
-wx250s/base_link
+- Click the Add button at the bottom left, and select `RobotModel`. You should now see the 3D model of your WidowX arm.
 
-/wx250s/robot_description
+- In the "Displays" panel on the left, find the field labeled "Description Topic" and change it to `/wx250s/robot_description`
 
-- Add ’`PointCloud2`’
-
-Connect the Camera to the Wrist running in another terminal:
+- Click "Add" again, go to the "By topic" tab, and find /camera/depth/color/points. Select `PointCloud2`
+  
+<br>
+Connect the Camera to the Wrist running in another terminal:<br><br>
 
 `rosrun tf static_transform_publisher 0.05 0 0.04 0 0 0 wx250s/ee_arm_link camera_link 100`
 
+## Scripts:
+
+In a terminal, go to:
+`interbotix_ws/src/interbotix_ros_manipulators/interbotix_ros_xsarms/examples/python_demos`
+
+here you will see different files but the relevant ones are three:
+- demo_collect_current.py
+- replay_live.py
+- call_replay_live_with_data.py
+
+There is another script we will be using but this one is located in the docker image that has been built, the script can be found here: <br>
+`1000_tasks/learning_thousand_tasks/deployment/deploy_mt3.py`
+
 ## Demonstration Collection pipeline:
 
-run the demonstration collector file
+### Code Architecture & Key Functions
+
+The `DemonstrationCollectorV2` class manages the lifecycle of a robot recording session. Below are the primary functional blocks:
+
+#### 1. Kinematics & State Estimation
+* **`_compute_eef_twist`**: Uses the **Modern Robotics** library to compute the end-effector (EEF) body-frame twist. It calculates the Space Jacobian ($J_s$) from joint positions and converts the resulting spatial twist into the body frame ($V_b$).
+* **`_extract_arm_state`**: Parses incoming ROS `JointState` messages to isolate the specific joint positions and velocities for the `wx250s` arm.
+
+#### 2. Computer Vision & Segmentation
+* **`_capture_workspace_camera_data`**: A blocking call that synchronizes and captures a single frame of RGB, Depth, and Camera Intrinsics via ROS topics.
+* **`simple_orange_segmentation_with_depth`**: The primary perception pipeline. It combines **HSV color thresholding** with **depth-gating** to isolate the target object (orange cube) from the table surface.
+* **`_refine_object_depth`**: A cleanup utility that uses a median filter on the segmented depth map to remove "holes" or outliers, ensuring a clean point cloud for later processing.
+
+#### 3. Recording & Hardware Control
+* **`start_recording` / `stop_recording`**: Manages the data buffers. Recording only begins once a "Ready Position" camera snapshot is successfully verified.
+* **`enable_teaching_mode`**: Disables motor torques on the Interbotix arm, allowing for **kinesthetic teaching** (moving the arm by hand).
+* **`record_step`**: The high-frequency loop function (running at the defined `record_rate`) that samples the current twist and appends it to the trajectory buffer.
+
+#### 4. Data Serialization
+* **`save_demonstrations`**: Handles the directory creation and converts Python lists into `.npy` (NumPy) and `.png` files. It enforces the `learning_thousand_tasks` naming convention required for training.
+
+<br><br>  
+
+Inside the `python_demos` directory run the demonstration collector file to record a demonstration:
 
 `python3 demo_collect_current.py` 
 
-instructions:
+Example of how to do it: [https://drive.google.com/drive/u/0/home](https://drive.google.com/file/d/1_yAW-ArX_D4vTTU7kbD1qVi1sqcG0pif/view?usp=sharing)
+
+Instructions:
 
 Controls during recording:
 
@@ -49,6 +89,30 @@ Controls during recording:
 - `'p': Print current EEF pose`
 - `'q': Quit and save demonstrations`
 
+- press `Ctrl + C` to stop the script
+
+The following data will save within the collected_demos/session_[TIMESTAMP]/demo0000/ directory.
+
+  ### Demonstration Data Structure (`demo0000`)
+
+| File Name | Data Type | Dimensions / Size | Description |
+| :--- | :--- | :--- | :--- |
+| **demo_eef_twists.npy** | NumPy Array (`float64`) | (T, 7) | Time-series of EEF twists: [vx, vy, vz, wx, wy, wz, gripper] |
+| **bottleneck_pose.npy** | NumPy Array (`float64`) | (4, 4) | The initial SE(3) transformation matrix of the end-effector |
+| **task_name.txt** | Plain Text | N/A | The string name of the task (e.g., pick_up_cube) |
+| **head_camera_ws_rgb.png** | Image (uint8) | (720, 1280, 3) | RGB workspace snapshot taken at the "Ready Position" |
+| **head_camera_ws_depth_to_rgb.png** | Image (uint16) | (720, 1280) | Aligned depth map in millimeters (mm) |
+| **head_camera_ws_segmap.npy** | NumPy Array (`bool`) | (720, 1280) | Boolean mask where True identifies the target object |
+| **head_camera_rgb_intrinsic_matrix.npy** | NumPy Array (`float64`) | (3, 3) | The camera intrinsic matrix K |
+| **eef_poses.npy** | NumPy Array (`float64`) | (T, 4, 4) | Full sequence of SE(3) matrices for the entire trajectory |
+| **timestamps.npy** | NumPy Array (`float64`) | (T,) | Relative time in seconds for each recorded timestep |
+| **metadata.pkl** | Python Pickle | Dictionary | Serialized metadata (robot model, joint names, rate, etc.) |
+
+**Note:** `T` represents the total number of timesteps recorded.
+
+Stop the `roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s` process before moving on to pass our collected demonstration to the mt3 pipeline. We are going to check the the demonstration has been correctly recorded by replaying it in the rviz simulator (real life robot will not replay it): <br><br>
+`roslaunch interbotix_xsarm_descriptions xsarm_description.launch robot_model:=wx200 use_joint_pub_gui:=true`
+  
 replay to check (no mt3 pipeline)
 
 python3 replay_demo_v2_last_2.py --demo_dir collected_demos/session_20260306_152850/demo_0000
