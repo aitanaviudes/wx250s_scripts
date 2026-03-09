@@ -15,7 +15,7 @@ you can check the topics of both the arm and intelisense camera doing:
 `rostopic list` 
 
 <br>
-In another terminal, for simplicity, launch another rviz window:
+In another terminal, for simplicity, launch another rviz window: <br><br>
 
 `rviz` 
 
@@ -30,7 +30,7 @@ In another terminal, for simplicity, launch another rviz window:
 <br>
 Connect the Camera to the Wrist running in another terminal:<br><br>
 
-`rosrun tf static_transform_publisher 0.05 0 0.04 0 0 0 wx250s/ee_arm_link camera_link 100`
+`rosrun tf static_transform_publisher 0.05 0 0.04 0 0 0 wx250s/ee_arm_link camera_link 100` <br><br>
 
 ## Scripts:
 
@@ -43,9 +43,9 @@ here you will see different files but the relevant ones are three:
 - call_replay_live_with_data.py
 
 There is another script we will be using but this one is located in the docker image that has been built, the script can be found here: <br>
-`1000_tasks/learning_thousand_tasks/deployment/deploy_mt3.py`
+`1000_tasks/learning_thousand_tasks/deployments/deploy_mt3.py` <br><br>
 
-## Demonstration Collection pipeline:
+## Demonstration Collection Pipeline:
 
 ### Code Architecture & Key Functions
 
@@ -68,7 +68,7 @@ The `DemonstrationCollectorV2` class manages the lifecycle of a robot recording 
 #### 4. Data Serialization
 * **`save_demonstrations`**: Handles the directory creation and converts Python lists into `.npy` (NumPy) and `.png` files. It enforces the `learning_thousand_tasks` naming convention required for training.
 
-<br><br>  
+<br> 
 
 Inside the `python_demos` directory run the demonstration collector file to record a demonstration:
 
@@ -112,8 +112,8 @@ The following data will save within the collected_demos/session_[TIMESTAMP]/demo
 
 Stop the `roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s` process before moving on to pass our collected demonstration to the mt3 pipeline. We are going to check the the demonstration has been correctly recorded by replaying it in the rviz simulator (real life robot will not replay it): <br><br>
 `roslaunch interbotix_xsarm_descriptions xsarm_description.launch robot_model:=wx200 use_joint_pub_gui:=true`
-
-## Demonstration Replay
+<br><br>
+## Demonstration Replay Pipeline
 
 To replay a previously recorded demonstration, run the `replay_live.py` script in the `python_demos` directory. The system will automatically detect if the physical robot is active or if it should run in RViz simulation mode.
 
@@ -127,23 +127,25 @@ The `replay_live.py` script utilizes a **Modern Robotics** based IK solver to tr
 1. **Initialization:** The script checks for the `xs_sdk` node. If missing, it enters **Simulation Mode**.
 2. **Trajectory Synthesis:** It loads the `.npy` files and uses `se3_exp` to integrate twists if necessary.
 3. **IK Verification:** It runs an IK pass for every waypoint, ensuring the path is physically reachable.
-4. **Execution:** - In **Real Mode**, it sends trajectory segments to the Dynamixel controllers.
+4. **Execution:**
+   - In **Real Mode**, it sends trajectory segments to the Dynamixel controllers.
    - In **Sim Mode**, it publishes JointStates to update the RViz model.
-
-If everything looks as expected, then we shouold run the bash script `update_demo.sh` inside `collected_demos`. <br>
-`./update_demo.sh -s session....` <br>
+<br><br>
+## Updating Inference and Demonstration Files in Docker Image
+If everything looks as expected, then we shouold run the bash script `update_demo.sh` inside `collected_demos`: <br><br>
+`./update_demo.sh -s session....` <br><br>
 What this file does is basically update the demonstration `pick_up_shoe` in `1000_tasks/learning_thousand_tasks/assets/demonstrations/pick_up_shoe` and also update the files inside `1000_tasks/learning_thousand_tasks/assets/inference_example`.
+<br><br>
+## Deploying MT3 Pipeline
+Now we can execute `make deploy_mt3` (inside `1000_tasks/learning_thousand_tasks/`). This runs the docker image, it is the main entry point of the mt3 pipeline and it also executes the file `1000_tasks/learning_thousand_tasks/deployments/deploy_mt3.py` which we will also be working with. The file has been updated towards the end to inlcude the following:
 
-Now we can execute `make deploy_mt3 ` (inside `1000_tasks/learning_thousand_tasks/`). This runs the docker image, it is the main entry point of the mt3 pipeline and it also executes the file `1000_tasks/learning_thousand_tasks/deployments/deploy_mt3.py` which we will also be working with. The file has been updated towards the end to inlcude the following:
-
-    `save_dir = Path('/workspace/saved_data')  # This is mounted to your host  
+    save_dir = Path('/workspace/saved_data')  # This is mounted to your host  
     save_dir.mkdir(parents=True, exist_ok=True)  
     
     np.save(save_dir / 'live_bottleneck_pose.npy', live_bottleneck_pose)  
-    np.save(save_dir / 'end_effector_twists.npy', end_effector_twists)`
+    np.save(save_dir / 'end_effector_twists.npy', end_effector_twists)
 
 This way, once the updated `live_bottleneck_pose` and `end_effector_twists` have been produced, we can save them to a directory in: `1000_tasks/learning_thousand_tasks/saved_data` we can access from outside the docker image.
 
-Make sure to execute `make deploy_mt3` with rviz simulator first (not real life) to see if the output of the mt3 pipeline looks correct and safe.
-
-python3 call_replay_live_with_saved_data.py
+Now we can run the last script: `python3 call_replay_live_with_saved_data.py` which will basically load saved MT3 data and replay it using the DemoReplayer. This script loads the live_bottleneck_pose and end_effector_twists saved by deploy_mt3.py and passes them to the ROS replay system. 
+Make sure to execute this file with rviz simulator first (not real life) to see if the output of the mt3 pipeline looks correct and safe.
