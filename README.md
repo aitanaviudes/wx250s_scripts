@@ -117,10 +117,10 @@ Stop the `roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=w
 
 To replay a previously recorded demonstration, run the `replay_live.py` script in the `python_demos` directory. The system will automatically detect if the physical robot is active or if it should run in RViz simulation mode.
 
-# Example: Replaying a specific demonstration
+### Example: Replaying a specific demonstration
 `python3 replay_live.py --demo_dir collected_demos/session_20260306_152850/demo_0000`
 
-### How Replay Works
+### Code Architecture & Key Functions
 
 The `replay_live.py` script utilizes a **Modern Robotics** based IK solver to translate end-effector targets into joint angles.
 
@@ -134,8 +134,16 @@ If everything looks as expected, then we shouold run the bash script `update_dem
 `./update_demo.sh -s session....` <br>
 What this file does is basically update the demonstration `pick_up_shoe` in `1000_tasks/learning_thousand_tasks/assets/demonstrations/pick_up_shoe` and also update the files inside `1000_tasks/learning_thousand_tasks/assets/inference_example`.
 
-Now we can execute 
+Now we can execute `make deploy_mt3 ` (inside `1000_tasks/learning_thousand_tasks/`). This runs the docker image, it is the main entry point of the mt3 pipeline and it also executes the file `1000_tasks/learning_thousand_tasks/deployments/deploy_mt3.py` which we will also be working with. The file has been updated towards the end to inlcude the following:
 
-make deploy_mt3 
+    `save_dir = Path('/workspace/saved_data')  # This is mounted to your host  
+    save_dir.mkdir(parents=True, exist_ok=True)  
+    
+    np.save(save_dir / 'live_bottleneck_pose.npy', live_bottleneck_pose)  
+    np.save(save_dir / 'end_effector_twists.npy', end_effector_twists)`
+
+This way, once the updated `live_bottleneck_pose` and `end_effector_twists` have been produced, we can save them to a directory in: `1000_tasks/learning_thousand_tasks/saved_data` we can access from outside the docker image.
+
+Make sure to execute `make deploy_mt3` with rviz simulator first (not real life) to see if the output of the mt3 pipeline looks correct and safe.
 
 python3 call_replay_live_with_saved_data.py
