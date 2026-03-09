@@ -149,3 +149,11 @@ This way, once the updated `live_bottleneck_pose` and `end_effector_twists` have
 
 Now we can run the last script: `python3 call_replay_live_with_saved_data.py` which will basically load saved MT3 data and replay it using the DemoReplayer. This script loads the live_bottleneck_pose and end_effector_twists saved by deploy_mt3.py and passes them to the ROS replay system. 
 Make sure to execute this file with rviz simulator first (not real life) to see if the output of the mt3 pipeline looks correct and safe.
+
+
+# TODO
+
+1. Update segmentation mask pipeline.
+   What learning 1000 tasks do:
+For the first frame, they use LangSAM (Language Segment Anything Model) to generate workspace segmentation from language prompts like "grey shoe on table" README.md:179 . This creates the binary mask head_camera_ws_segmap.npy that identifies the target object. We should use the same approach as them and not hardcode a function for orange cubes as we are currently doing in `simple_orange_segmentation_with_depth`
+2. We should subsititue our inverse kinematics functions and use Moveit instead.
