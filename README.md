@@ -18,6 +18,24 @@ in a second terminal:
   3. Terminal 3 (collector):
      python3 demo_collect_current_2.py --robot_model wx250s --robot_name wx250s
 
+repolay:
+
+• Use this sequence.
+
+  1. Terminal 1, real robot driver:
+     roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s robot_name:=wx250s load_configs:=false
+  2. Terminal 2, MoveIt connected to that driver:
+     roslaunch interbotix_xsarm_moveit xsarm_moveit.launch robot_model:=wx250s robot_name:=wx250s use_actual:=false dof:=6
+  3. Terminal 3, replay (dry run first):
+     python3 replay_live_c.py --demo_dir /home/aitana_viudes/interbotix_ws/src/interbotix_ros_manipulators/interbotix_ros_xsarms/examples/python_demos/
+     collected_demos/<session>/demo_0000 --dry_run --start_idx 73
+  4. If fraction is good, execute for real:
+     python3 replay_live_c.py --demo_dir /home/aitana_viudes/interbotix_ws/src/interbotix_ros_manipulators/interbotix_ros_xsarms/examples/python_demos/
+     collected_demos/<session>/demo_0000 --start_idx 73
+
+  Use your actual session folder instead of <session>.
+
+
 
 you can check the topics of both the arm and intelisense camera doing:
 
