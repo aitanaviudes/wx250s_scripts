@@ -9,6 +9,15 @@ run in a terminal:
 in a second terminal:
 
 `roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s` 
+`roslaunch interbotix_xsarm_moveit xsarm_moveit.launch robot_model:=wx250s robot_name:=wx250s use_actual:=true dof:=6`
+
+  1. Terminal 1 (driver only):
+     roslaunch interbotix_xsarm_control xsarm_control.launch robot_model:=wx250s robot_name:=wx250s load_configs:=false
+  2. Terminal 2 (MoveIt only, connect to already-running driver):
+     roslaunch interbotix_xsarm_moveit xsarm_moveit.launch robot_model:=wx250s robot_name:=wx250s use_actual:=false dof:=6
+  3. Terminal 3 (collector):
+     python3 demo_collect_current_2.py --robot_model wx250s --robot_name wx250s
+
 
 you can check the topics of both the arm and intelisense camera doing:
 
